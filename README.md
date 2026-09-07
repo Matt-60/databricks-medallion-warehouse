@@ -34,9 +34,26 @@ GOLD    — dimensional model (star schema)
 | **Silver** | Deduplicates via `ROW_NUMBER()` (latest version per `order_id`), standardizes fields (e.g. uppercased customer name), and `MERGE`s into a current-state table. Stores `process_ts`. |
 | **Gold** | Star schema: `DimCustomers`, `DimProducts` (incremental `MERGE`, SCD Type 1), `DimPayments`/`DimRegion` (small reference dimensions via `DISTINCT` + `MERGE`), `DimDate` (generated from the transactional date range), and `FactSales` (incremental `MERGE`, joined to all dimensions for surrogate keys). |
 
+## ⚙️ Orchestration
+
+<img width="1526" height="349" alt="image" src="https://github.com/user-attachments/assets/55ccaf4d-fe55-454e-8d1b-320738fac5fc" />
+
+
+A **Databricks Job** runs the full pipeline, with a conditional branch that automatically distinguishes a first-time run from a regular incremental run:
+
+1. **`Check_Source_Exists`** — a small Python task checks whether the source table already exists (`spark.catalog.tableExists(...)`) and stores the result as a task value.
+2. **`Initial_batch_load`** (If/else condition) — evaluates that task value (`{{tasks.Check_Source_Exists.values.source_exists}} == "True"`) and branches:
+   - **False** (source doesn't exist yet) → **`Initial_load`** — creates and seeds the source table
+   - **True** (source already exists) → **`Batch`** — simulates an incremental insert + update
+3. **`Bronze`** depends on *both* branches, with **Run if: At least one succeeded** — since only one of the two branches actually runs (the other is skipped), the default "All succeeded" condition doesn't work here; the pipeline needs at least one of its two parents to have completed successfully.
+4. **`Silver`** → **`Gold`** run in sequence after Bronze, as before.
+
+This means the same Job can be run repeatedly, on a schedule, without manual intervention — the first run seeds the environment, every run after that treats it as an established source and processes incremental changes. Verified with two consecutive Job runs (clean environment → `Initial_load` path; existing environment → `Batch` path).
+
 ## ⭐ Data Model
 
-`FactSales` at the center — `customer_sk`, `product_sk`, `payment_sk`, `region_sk`, `date_key` as foreign keys, `quantity` / `unit_price` / `sales_amount` (`= quantity × unit_price`) as measures — surrounded by `DimCustomers`, `DimProducts`, `DimPayments`, `DimRegion`, `DimDate`.
+<img width="1220" height="558" alt="image" src="https://github.com/user-attachments/assets/e2a7a328-7677-467d-86cd-7eb05bb8a7f8" />
+
 
 <details>
 <summary><b>📐 Incremental logic per layer (click to expand)</b></summary>
@@ -100,7 +117,7 @@ The watermark column (`last_updated`) is `DATE`, not `TIMESTAMP`. Because the in
 | Databricks | Notebook environment, compute |
 | Delta Lake | ACID tables, `MERGE`, identity columns |
 | Spark SQL | All transformation and modeling logic |
-| Databricks Jobs | Intended orchestration (Bronze → Silver → Gold) |
+| Databricks Jobs | Orchestration — conditional branching (If/else), watermark-driven Bronze → Silver → Gold |
 
 **Repository structure**
 ```
