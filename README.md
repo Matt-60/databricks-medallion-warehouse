@@ -1,382 +1,128 @@
 # Databricks Medallion Data Warehouse
 
-## Overview
+An end-to-end data warehouse pipeline in Databricks — Bronze → Silver → Gold — built on Delta Lake with incremental loading, deduplication, and dimensional modeling.
 
-This project demonstrates the design and implementation of an **end-to-end data warehouse pipeline in Databricks** using **Medallion Architecture**, Delta Lake, PySpark, and SQL.
-
-The solution processes transactional e-commerce data through Bronze, Silver, and Gold layers, applying incremental data loading, deduplication, `MERGE` operations, dimensional modeling, surrogate keys, and incremental fact processing.
-
-The project is designed to simulate a production-oriented data engineering workflow, including orchestration with **Databricks Jobs**.
+`Databricks` · `Delta Lake` · `Spark SQL` · `Star Schema` · `SCD Type 1`
 
 ---
 
-## Architecture
+## 🎯 Business Goal
 
-```text
-                         SOURCE
-                            │
-                            ▼
-                 ┌────────────────────┐
-                 │      BRONZE        │
-                 │ Incremental Append │
-                 └─────────┬──────────┘
-                           │
-                           ▼
-                 ┌────────────────────┐
-                 │      SILVER        │
-                 │ Incremental MERGE  │
-                 │ Deduplication      │
-                 │ Standardization    │
-                 └─────────┬──────────┘
-                           │
-                           ▼
-                 ┌────────────────────┐
-                 │       GOLD         │
-                 │ Dimensional Model  │
-                 └─────────┬──────────┘
-                           │
-              ┌────────────┴────────────┐
-              │                         │
-              ▼                         ▼
-        DIMENSIONS                   FACT
-       MERGE / Lookup          Incremental MERGE
-              │                         │
-              └────────────┬────────────┘
-                           ▼
-                      DATA MART
+A transactional e-commerce source needs to feed a reliable, incrementally-updated star schema for sales reporting — without reprocessing the full history on every run, and without losing track of order updates (not just new orders). This project builds that pipeline end to end: raw orders land in Bronze, get cleaned and deduplicated in Silver, and are modeled into a Gold-layer star schema ready for BI consumption.
+
+## 🏗️ Architecture
+
+```
+SOURCE
+  │
+  ▼
+BRONZE  — incremental append (watermark on last_updated)
+  │
+  ▼
+SILVER  — incremental MERGE, dedup, standardization
+  │
+  ▼
+GOLD    — dimensional model (star schema)
+  │
+  ├── Dimensions (MERGE / lookup) ──┐
+  └── Fact (incremental MERGE) ─────┴──► Data Mart
 ```
 
-### Medallion Layers
+| Layer | What happens |
+|---|---|
+| **Bronze** | Raw records appended incrementally, filtered by a `last_updated` watermark against the max value already in Bronze. Stores `ingestion_ts` for auditing. |
+| **Silver** | Deduplicates via `ROW_NUMBER()` (latest version per `order_id`), standardizes fields (e.g. uppercased customer name), and `MERGE`s into a current-state table. Stores `process_ts`. |
+| **Gold** | Star schema: `DimCustomers`, `DimProducts` (incremental `MERGE`, SCD Type 1), `DimPayments`/`DimRegion` (small reference dimensions via `DISTINCT` + `MERGE`), `DimDate` (generated from the transactional date range), and `FactSales` (incremental `MERGE`, joined to all dimensions for surrogate keys). |
 
-**Bronze**
+## ⭐ Data Model
 
-* Raw source data stored in Delta format
-* Incremental ingestion
-* Append-based loading
-* Preserves incoming source records and changes
-* Uses `last_updated` as an incremental watermark
-* Stores `ingestion_ts` for pipeline auditing
+`FactSales` at the center — `customer_sk`, `product_sk`, `payment_sk`, `region_sk`, `date_key` as foreign keys, `quantity` / `unit_price` / `sales_amount` (`= quantity × unit_price`) as measures — surrounded by `DimCustomers`, `DimProducts`, `DimPayments`, `DimRegion`, `DimDate`.
 
-**Silver**
+<details>
+<summary><b>📐 Incremental logic per layer (click to expand)</b></summary>
 
-* Cleaned and standardized data
-* Incremental processing
-* `MERGE` used to maintain the latest version of each order
-* Deduplication using `ROW_NUMBER()`
-* Data transformations such as customer name standardization
-* Stores `process_ts` to track processing time
-
-**Gold**
-
-* Dimensional data warehouse model
-* Surrogate keys generated using Delta identity columns
-* Customer and product dimensions maintained using incremental `MERGE`
-* Small reference dimensions such as payment types and countries maintained using `DISTINCT` and `MERGE`
-* Date dimension generated from the transactional date range
-* Sales fact table processed incrementally
-
----
-
-## Data Model
-
-The Gold layer follows a **star schema**:
-
-```text
-                    ┌─────────────────┐
-                    │  DimCustomers   │
-                    │-----------------│
-                    │ customer_sk (PK)│
-                    │ customer_id     │
-                    │ customer_name   │
-                    │ customer_email  │
-                    └────────┬────────┘
-                             │
-                             │
-┌─────────────────┐          │          ┌─────────────────┐
-│  DimProducts    │          │          │   DimPayments   │
-│-----------------│          │          │-----------------│
-│ product_sk (PK) │          │          │ payment_sk (PK)│
-│ product_id      │          │          │ payment_type   │
-│ product_name    │          │          └────────┬────────┘
-│ category        │          │                   │
-└────────┬────────┘          │                   │
-         │                   ▼                   │
-         │          ┌─────────────────┐          │
-         └─────────►│    FactSales    │◄─────────┘
-                    │-----------------│
-                    │ order_id        │
-                    │ customer_sk     │
-                    │ product_sk      │
-                    │ payment_sk      │
-                    │ region_sk       │
-                    │ date_key        │
-                    │ quantity        │
-                    │ unit_price      │
-                    │ sales_amount    │
-                    └────────┬────────┘
-                             │
-                  ┌──────────┴──────────┐
-                  ▼                     ▼
-          ┌─────────────────┐   ┌─────────────────┐
-          │    DimRegion    │   │     DimDate     │
-          │-----------------│   │-----------------│
-          │ region_sk (PK)  │   │ date_key (PK)   │
-          │ country         │   │ full_date       │
-          └─────────────────┘   │ year/month/...  │
-                                └─────────────────┘
-```
-
-### Dimensions
-
-* **DimCustomers** — customer attributes and surrogate key
-* **DimProducts** — product attributes and surrogate key
-* **DimPayments** — unique payment methods
-* **DimRegion** — unique countries
-* **DimDate** — calendar dimension
-
-### Fact
-
-**FactSales** contains transactional sales data and foreign keys to the dimensions.
-
-The main measure is:
-
-```text
-sales_amount = quantity × unit_price
-```
-
----
-
-## Incremental Processing
-
-Incremental processing is implemented throughout the pipeline where it provides the most value.
-
-### Bronze
-
-New source records are identified using the maximum `last_updated` value already present in Bronze:
-
+**Bronze — watermark append**
 ```sql
-WHERE last_updated > last_load_date
+WHERE last_updated > last_load_date   -- last_load_date = MAX(last_updated) already in Bronze
 ```
 
-The new records are appended to the Bronze Delta table.
-
-### Silver
-
-Silver processes only records that are newer than the latest processed timestamp/date and uses `MERGE` to maintain the current state:
-
+**Silver — dedup + current-state MERGE**
 ```sql
-MERGE INTO silver_table t
-USING silver_source s
-ON t.order_id = s.order_id
+ROW_NUMBER() OVER (PARTITION BY order_id ORDER BY last_updated DESC)
+-- keep rn = 1, then:
+MERGE INTO silver_table t USING silver_source s ON t.order_id = s.order_id
+WHEN MATCHED AND s.last_updated > t.last_updated THEN UPDATE SET *
+WHEN NOT MATCHED THEN INSERT *
 ```
 
-The latest record for each order is selected using:
-
+**Gold dimensions — SCD Type 1**
 ```sql
-ROW_NUMBER() OVER (
-    PARTITION BY order_id
-    ORDER BY last_updated DESC
-)
+WHEN MATCHED AND s.last_updated > t.last_updated THEN UPDATE SET ...
+WHEN NOT MATCHED THEN INSERT ...
 ```
+Surrogate keys (`customer_sk`, `product_sk`, …) are generated once via Delta identity columns and stay stable across updates — the `MERGE` never touches them.
 
-This prevents multiple versions of the same order from being loaded into the current-state Silver table.
-
-### Gold Dimensions
-
-Customer and product dimensions use incremental `MERGE` operations.
-
-For example:
-
+**Gold fact — incremental, joined to dimensions**
 ```sql
-WHEN MATCHED AND s.last_updated > t.last_updated
-THEN UPDATE SET ...
-
-WHEN NOT MATCHED
-THEN INSERT ...
+FROM silver_table f
+LEFT JOIN dimcustomers c ON f.customer_id = c.customer_id
+LEFT JOIN dimproducts p ON f.product_id = p.product_id
+...
+WHERE f.last_updated > (SELECT COALESCE(MAX(last_updated), '1000-01-01') FROM fact_sales)
 ```
 
-This implements **SCD Type 1 behavior**, where updated attributes overwrite the previous values.
+</details>
 
-Surrogate keys remain stable because they are generated in the dimension tables and are not updated during a `MERGE`.
+## 🧪 Change Simulation
 
-### Gold Fact
+The pipeline is validated against a simple two-batch scenario: an **initial load** (3 orders), then a **batch** that both **inserts** a new order and **updates** an existing one — exercising both incremental paths (new record vs. changed record) end to end through Bronze → Silver → Gold.
 
-The `FactSales` table is also processed incrementally.
+## 🧠 Key Design Decisions
 
-New or changed transactions are identified using `last_updated` and then merged into the fact table based on `order_id`.
+- **Incremental everywhere it earns its place** — Bronze, Silver, and the fact table are all watermark-driven; small reference dimensions (`DimPayments`, `DimRegion`) are kept simple via plain `DISTINCT` + `MERGE` rather than over-engineering incremental logic where the data volume doesn't justify it.
+- **Delta identity columns for surrogate keys** — decouples source-system IDs (`customer_id`, `product_id`) from warehouse keys, keeping fact-table foreign keys stable even if source identifiers change.
+- **SCD Type 1 for dimensions** — attributes are overwritten on update; historical versions aren't preserved, a deliberate simplification for this dataset (see Future Improvements for SCD2).
 
-This avoids rebuilding the entire fact table for every pipeline execution.
+<details>
+<summary><b>⚠️ Known limitation (click to expand)</b></summary>
+
+The watermark column (`last_updated`) is `DATE`, not `TIMESTAMP`. Because the incremental filter is a strict `>`, a record updated on the *same day* as the last successful load could be missed on the next run. Fine for daily-batch demo data; a production version should use a `TIMESTAMP` watermark (or `>=` with a de-dup-safe re-read window).
+
+</details>
+
+<details>
+<summary><b>🛠️ Tech stack, repo structure & future improvements (click to expand)</b></summary>
+
+**Technology Stack**
+
+| Technology | Purpose |
+|---|---|
+| Databricks | Notebook environment, compute |
+| Delta Lake | ACID tables, `MERGE`, identity columns |
+| Spark SQL | All transformation and modeling logic |
+| Databricks Jobs | Intended orchestration (Bronze → Silver → Gold) |
+
+**Repository structure**
+```
+Databricks-Medallion-Architecture-Project/
+├── Source (intial load).ipynb   # creates + seeds the source table
+├── Batch load.ipynb             # simulates an insert + an update
+├── Bronze.ipynb
+├── Silver.ipynb
+├── Gold.ipynb
+└── Drop tables.ipynb            # teardown for a clean re-run
+```
+
+**Future Improvements**
+- Handle late-arriving records; move the watermark to `TIMESTAMP` granularity
+- Data quality checks
+- SCD Type 2 for selected dimensions
+- Pipeline monitoring/logging, parameterized notebooks per environment
+- Automated testing
+- Connect the Gold layer to a BI tool (Power BI)
+
+</details>
 
 ---
 
-## Surrogate Keys
-
-The dimensional model uses surrogate keys generated by Delta identity columns:
-
-```sql
-customer_sk BIGINT GENERATED ALWAYS AS IDENTITY
-```
-
-The source business keys remain available:
-
-```text
-customer_id
-product_id
-```
-
-while the surrogate keys are used as foreign keys in the fact table:
-
-```text
-FactSales
-├── customer_sk
-├── product_sk
-├── payment_sk
-├── region_sk
-└── date_key
-```
-
-This separates source-system identifiers from warehouse keys and provides stable dimension references for the fact table.
-
----
-
-## Change Data Simulation
-
-To test the incremental pipeline, source-system changes are simulated through separate batches.
-
-### Initial Load
-
-```text
-2024-07-01
-
-1001
-1002
-1003
-```
-
-### Batch 1
-
-The first incremental batch contains:
-
-```text
-2024-07-02
-
-INSERT → order_id 1004
-UPDATE → order_id 1001
-```
-
-This allows the pipeline to demonstrate both major incremental scenarios:
-
-* inserting a new record
-* updating an existing record
-
-The changes propagate through:
-
-```text
-Source
-  ↓
-Bronze
-  ↓
-Silver
-  ↓
-Gold Dimensions
-  ↓
-FactSales
-```
-
-This provides a simple way to validate the complete end-to-end pipeline.
-
----
-
-## Orchestration
-
-The notebooks are orchestrated using **Databricks Jobs**.
-
-The execution flow is:
-
-```text
-01_Bronze
-    │
-    ▼
-02_Silver
-    │
-    ▼
-03_Gold
-```
-
-The Gold notebook builds the dimensional model and fact table after Silver has been successfully processed.
-
-The job can be scheduled to run automatically, allowing the pipeline to process new source changes without manually executing each notebook.
-
----
-
-## Technology Stack
-
-| Technology          | Purpose                                     |
-| ------------------- | ------------------------------------------- |
-| **Databricks**      | Data processing and orchestration           |
-| **PySpark**         | Incremental processing and Spark operations |
-| **Spark SQL**       | Data transformation and modeling            |
-| **Delta Lake**      | ACID tables and reliable data storage       |
-| **SQL**             | Data manipulation and dimensional modeling  |
-| **Databricks Jobs** | Pipeline orchestration and scheduling       |
-
----
-
-## Key Concepts Demonstrated
-
-* Medallion Architecture
-* Delta Lake
-* Incremental data loading
-* Append-only ingestion
-* Incremental `MERGE`
-* Deduplication with `ROW_NUMBER()`
-* Watermark-based processing
-* SCD Type 1
-* Surrogate keys
-* Star schema
-* Fact and dimension tables
-* Data standardization
-* Audit timestamps
-* Incremental fact processing
-* Databricks Jobs and orchestration
-
----
-
-## Project Structure
-
-```text
-databricks-medallion-dwh/
-│
-├── notebooks/
-│   ├── 01_bronze
-│   ├── 02_silver
-│   └── 03_gold
-│
-├── README.md
-└── ...
-```
-
----
-
-## Future Improvements
-
-Potential extensions to make the pipeline more production-oriented include:
-
-* handling late-arriving records
-* replacing simple watermarks with more robust ingestion metadata
-* implementing data quality checks
-* adding SCD Type 2 for selected dimensions
-* adding pipeline monitoring and logging
-* parameterizing notebooks for different environments
-* implementing automated testing
-* integrating the Gold layer with a BI reporting solution
-
----
-
-## Summary
-
-This project demonstrates an end-to-end **Databricks data warehouse pipeline** that combines Medallion Architecture with dimensional modeling and incremental data processing.
-
-The main design principle is to use incremental processing where it provides meaningful performance benefits while keeping smaller reference dimensions simple and maintainable.
-
-The result is a scalable and production-oriented architecture suitable for analytical workloads and downstream BI consumption.
+*Demonstrates Medallion architecture, Delta Lake `MERGE` patterns, watermark-based incremental loading, and dimensional modeling on Databricks.*
