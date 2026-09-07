@@ -2,7 +2,7 @@
 
 An end-to-end data warehouse pipeline in Databricks — Bronze → Silver → Gold — built on Delta Lake with incremental loading, deduplication, and dimensional modeling.
 
-`Databricks` · `Delta Lake` · `Spark SQL` · `Star Schema` · `SCD Type 1`
+`Databricks` · `Delta Lake` · `Spark SQL` · `Star Schema`
 
 ---
 
@@ -11,22 +11,6 @@ An end-to-end data warehouse pipeline in Databricks — Bronze → Silver → Go
 A transactional e-commerce source needs to feed a reliable, incrementally-updated star schema for sales reporting — without reprocessing the full history on every run, and without losing track of order updates (not just new orders). This project builds that pipeline end to end: raw orders land in Bronze, get cleaned and deduplicated in Silver, and are modeled into a Gold-layer star schema ready for BI consumption.
 
 ## 🏗️ Architecture
-
-```
-SOURCE
-  │
-  ▼
-BRONZE  — incremental append (watermark on last_updated)
-  │
-  ▼
-SILVER  — incremental MERGE, dedup, standardization
-  │
-  ▼
-GOLD    — dimensional model (star schema)
-  │
-  ├── Dimensions (MERGE / lookup) ──┐
-  └── Fact (incremental MERGE) ─────┴──► Data Mart
-```
 
 | Layer | What happens |
 |---|---|
