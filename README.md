@@ -92,6 +92,19 @@ The watermark column (`last_updated`) is `DATE`, not `TIMESTAMP`. Because the in
 </details>
 
 <details>
+<summary><b>🔄 Production backfill strategy (click to expand)</b></summary>
+
+This project's watermark is recomputed dynamically (`MAX(last_updated)` from the target table) rather than stored as a separate checkpoint, so a watermark-based batch pipeline like this one has no built-in way to reprocess a specific historical date range, and no protection against late-arriving source updates — a record that commits to the source *after* the pipeline has already advanced past its timestamp would simply be missed on every future run.
+
+There are two production-grade ways to cover this. The first is a **parameterized date-range backfill**: the notebooks accept an optional start/end date, and when those parameters are set, the pipeline reprocesses that explicit window instead of relying on the dynamic watermark. This is reactive — someone (or a data-quality alert) has to notice that a gap exists and manually trigger a backfill run with the right dates — but it's cheap to add, and it's safe here specifically because every layer already writes through an idempotent `MERGE`, so reprocessing the same window any number of times just converges to the same result rather than creating duplicates.
+
+The second is **CDC / Delta Lake Change Data Feed**: instead of filtering on a mutable timestamp column, each layer reads changes by table version or commit log, so a late-arriving write is picked up automatically no matter when it actually lands — nothing is ever silently missed. This is the structurally correct fix, but it's a bigger change: every layer needs to switch from a date-based filter to a version-based checkpoint, and it only works if applied consistently at *every* hop in the pipeline (Source → Bronze → Silver → Gold) — skip one layer and the exact same ordering problem just reappears one step down.
+
+**For this project, the parameterized backfill is the better fit.** The data volume and update frequency here don't justify the extra complexity of version-based checkpoints across every layer — an occasional late correction is easy to catch and reprocess manually, and the cost of building and maintaining CDC/CDF end to end would outweigh the benefit at this scale. CDC/CDF would earn its place in a higher-volume, business-critical pipeline where an undetected gap in fact data isn't an acceptable risk.
+
+</details>
+
+<details>
 <summary><b>🛠️ Tech stack, repo structure & future improvements (click to expand)</b></summary>
 
 **Technology Stack**
@@ -105,7 +118,7 @@ The watermark column (`last_updated`) is `DATE`, not `TIMESTAMP`. Because the in
 
 **Repository structure**
 ```
-Databricks-Medallion-Architecture-Project/
+databricks-medallion-warehouse/
 ├── Source (intial load).ipynb   # creates + seeds the source table
 ├── Batch load.ipynb             # simulates an insert + an update
 ├── Bronze.ipynb
@@ -116,6 +129,7 @@ Databricks-Medallion-Architecture-Project/
 
 **Future Improvements**
 - Handle late-arriving records; move the watermark to `TIMESTAMP` granularity
+- Parameterized backfill mode (see above)
 - Data quality checks
 - SCD Type 2 for selected dimensions
 - Pipeline monitoring/logging, parameterized notebooks per environment
