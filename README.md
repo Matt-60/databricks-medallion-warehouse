@@ -1,55 +1,71 @@
 # Databricks Medallion Data Warehouse
 
-An end-to-end data warehouse pipeline in Databricks — Bronze → Silver → Gold — built on Delta Lake with incremental loading, deduplication, and dimensional modeling.
+An end-to-end data warehouse pipeline in Databricks — Source → Bronze → Silver → Gold — built on Delta Lake with watermark-based incremental loading, deterministic deduplication, a star schema with Unknown members, automated data quality checks, and a Job deployed as code via Databricks Asset Bundles.
 
-`Databricks` · `Delta Lake` · `Spark SQL` · `Star Schema`
+`Databricks` · `Delta Lake` · `Spark SQL` · `Star Schema` · `Asset Bundles`
 
 ---
 
 ## 🎯 Business Goal
 
-A transactional e-commerce source needs to feed a reliable, incrementally-updated star schema for sales reporting — without reprocessing the full history on every run, and without losing track of order updates (not just new orders). This project builds that pipeline end to end: raw orders land in Bronze, get cleaned and deduplicated in Silver, and are modeled into a Gold-layer star schema ready for BI consumption.
+A transactional e-commerce source needs to feed a reliable, incrementally-updated star schema for sales reporting — without reprocessing the full history on every run, and without losing track of order updates (not just new orders). This project builds that pipeline end to end: raw orders land in Bronze, get cleaned and deduplicated in Silver, are modeled into a Gold-layer star schema, and are validated by data quality checks before the run is marked successful.
 
 ## 🏗️ Architecture
 
+All tables live in Unity Catalog under `datamodeling.{source, bronze, silver, gold}`.
+
 | Layer | What happens |
 |---|---|
-| **Bronze** | Raw records appended incrementally, filtered by a `last_updated` watermark against the max value already in Bronze. Stores `ingestion_ts` for auditing. |
-| **Silver** | Deduplicates via `ROW_NUMBER()` (latest version per `order_id`), standardizes fields (e.g. uppercased customer name), and `MERGE`s into a current-state table. Stores `process_ts`. |
-| **Gold** | Star schema: `DimCustomers`, `DimProducts` (incremental `MERGE`, SCD Type 1), `DimPayments`/`DimRegion` (small reference dimensions via `DISTINCT` + `MERGE`), `DimDate` (generated from the transactional date range), and `FactSales` (incremental `MERGE`, joined to all dimensions for surrogate keys). |
+| **Source** | Simulated OLTP table (`source_data`) with a `TIMESTAMP` `last_updated` column and Change Data Feed enabled. |
+| **Bronze** | Raw records appended incrementally, filtered by a `last_updated` watermark (`MAX(last_updated)` already in Bronze). Adds `ingestion_ts = current_timestamp()` for auditing. |
+| **Silver** | Deduplicates with `ROW_NUMBER()` (latest version per `order_id`, ties broken by `ingestion_ts`), standardizes fields (trimmed names, lower-cased emails, `INITCAP` payment types, upper-cased countries) and `MERGE`s into a current-state table. Adds `process_ts`. |
+| **Gold** | Star schema: `dimcustomers`, `dimproducts` (incremental `MERGE`, SCD Type 1), `dimpayments` / `dimregion` (small reference dimensions via `DISTINCT` + `MERGE`), `dim_date` (generated from the order date range) and `fact_sales` (incremental `MERGE`, joined to all dimensions for surrogate keys). Every dimension has an **Unknown member (`-1`)**. |
+| **DQ** | `Data_Quality_Checks` runs six checks, appends results to `gold.dq_results` and fails the Job if any check fails. |
 
 ## ⚙️ Orchestration
 
-<img width="1526" height="349" alt="image" src="https://github.com/user-attachments/assets/55ccaf4d-fe55-454e-8d1b-320738fac5fc" />
-
+<img width="1289" height="176" alt="image" src="https://github.com/user-attachments/assets/5f7cc404-0555-4fa1-9962-b0f092e693aa" />
 
 A **Databricks Job** runs the full pipeline, with a conditional branch that automatically distinguishes a first-time run from a regular incremental run:
 
-1. **`Check_Source_Exists`** — a small Python task checks whether the source table already exists (`spark.catalog.tableExists(...)`) and stores the result as a task value.
-2. **`Initial_batch_load`** (If/else condition) — evaluates that task value (`{{tasks.Check_Source_Exists.values.source_exists}} == "True"`) and branches:
-   - **False** (source doesn't exist yet) → **`Initial_load`** — creates and seeds the source table
-   - **True** (source already exists) → **`Batch`** — simulates an incremental insert + update
-3. **`Bronze`** depends on *both* branches, with **Run if: At least one succeeded** — since only one of the two branches actually runs (the other is skipped), the default "All succeeded" condition doesn't work here; the pipeline needs at least one of its two parents to have completed successfully.
-4. **`Silver`** → **`Gold`** run in sequence after Bronze, as before.
+1. **`Check_Source_Exists`** — checks whether the source table exists (`spark.catalog.tableExists(...)`) and stores `"true"` / `"false"` as a task value.
+2. **`Initial_batch_load`** (If/else condition) — `{{tasks.Check_Source_Exists.values.source_exists}} == "true"`:
+   - **false** (first run) → **`Initial_load`** — creates and seeds the source table
+   - **true** (source exists) → **`Batch`** — simulates incremental inserts and an update
+3. **`Bronze`** depends on *both* branches with **Run if: At least one succeeded** — only one branch runs and the other is skipped, so the default "All succeeded" would never fire.
+4. **`Silver`** → **`Gold`** → **`Data_quality_checks`** run in sequence.
 
-This means the same Job can be run repeatedly, on a schedule, without manual intervention — the first run seeds the environment, every run after that treats it as an established source and processes incremental changes. Verified with two consecutive Job runs (clean environment → `Initial_load` path; existing environment → `Batch` path).
+The same Job can be run repeatedly on a schedule: the first run seeds the environment, every later run processes incremental changes.
+
+### Job as code (Asset Bundle)
+
+The Job is defined in [`resources/full_pipeline_data_modeling_project.job.yml`](resources/full_pipeline_data_modeling_project.job.yml) with notebook paths relative to the repo, and deployed with the bundle in [`databricks.yml`](databricks.yml):
+
+```bash
+databricks bundle validate
+databricks bundle deploy -t dev
+databricks bundle run full_pipeline_data_modeling_project -t dev
+```
+
+The bundle can also be deployed straight from a Databricks Git folder (**Deployments → Deploy**). The `dev` target deploys a prefixed, per-user copy; `prod` deploys a single shared copy.
 
 ## ⭐ Data Model
 
-<img width="1220" height="558" alt="image" src="https://github.com/user-attachments/assets/e2a7a328-7677-467d-86cd-7eb05bb8a7f8" />
-
+<img width="1220" height="558" alt="Star schema" src="https://github.com/user-attachments/assets/e2a7a328-7677-467d-86cd-7eb05bb8a7f8" />
 
 <details>
 <summary><b>📐 Incremental logic per layer (click to expand)</b></summary>
 
 **Bronze — watermark append**
 ```sql
-WHERE last_updated > last_load_date   -- last_load_date = MAX(last_updated) already in Bronze
+SELECT COALESCE(MAX(last_updated), TIMESTAMP '1900-01-01') FROM bronze_table  -- watermark
+...
+WHERE last_updated > TIMESTAMP '{last_load_ts}'
 ```
 
-**Silver — dedup + current-state MERGE**
+**Silver — deterministic dedup + current-state MERGE**
 ```sql
-ROW_NUMBER() OVER (PARTITION BY order_id ORDER BY last_updated DESC)
+ROW_NUMBER() OVER (PARTITION BY order_id ORDER BY last_updated DESC, ingestion_ts DESC)
 -- keep rn = 1, then:
 MERGE INTO silver_table t USING silver_source s ON t.order_id = s.order_id
 WHEN MATCHED AND s.last_updated > t.last_updated THEN UPDATE SET *
@@ -61,46 +77,66 @@ WHEN NOT MATCHED THEN INSERT *
 WHEN MATCHED AND s.last_updated > t.last_updated THEN UPDATE SET ...
 WHEN NOT MATCHED THEN INSERT ...
 ```
-Surrogate keys (`customer_sk`, `product_sk`, …) are generated once via Delta identity columns and stay stable across updates — the `MERGE` never touches them.
+Surrogate keys are Delta identity columns (`GENERATED BY DEFAULT AS IDENTITY`) — stable across updates, since the `MERGE` never touches them. `BY DEFAULT` (not `ALWAYS`) allows the explicit `-1` Unknown row.
 
-**Gold fact — incremental, joined to dimensions**
+**Gold fact — incremental, joined to dimensions, never NULL keys**
 ```sql
+COALESCE(c.customer_sk, -1) AS customer_sk,
+...
 FROM silver_table f
 LEFT JOIN dimcustomers c ON f.customer_id = c.customer_id
-LEFT JOIN dimproducts p ON f.product_id = p.product_id
 ...
-WHERE f.last_updated > (SELECT COALESCE(MAX(last_updated), '1000-01-01') FROM fact_sales)
+WHERE f.last_updated > (SELECT COALESCE(MAX(last_updated), TIMESTAMP '1900-01-01') FROM fact_sales)
 ```
 
 </details>
 
 ## 🧪 Change Simulation
 
-The pipeline is validated against a simple two-batch scenario: an **initial load** (3 orders), then a **batch** that both **inserts** a new order and **updates** an existing one — exercising both incremental paths (new record vs. changed record) end to end through Bronze → Silver → Gold.
+| Run | Path | Changes | What it tests |
+|---|---|---|---|
+| 1 | `Initial_load` | Orders 1001–1003 inserted | Full first load through every layer |
+| 2 | `Batch` | Order 1001 updated (quantity 1 → 2) **on the same day** as the initial load | Update path + `TIMESTAMP` watermark (a `DATE` watermark would miss it) |
+| | | Order 1004 inserted — new customer, new country (UK) | New dimension members |
+| | | Order 1005 inserted — existing customer with a new email, `NULL` payment type | SCD1 overwrite in `dimcustomers` + fact row mapped to Unknown (`payment_sk = -1`) |
+
+`Batch_load` inserts through `MERGE`, so re-running it doesn't create duplicates.
+
+## ✅ Data Quality Checks
+
+Each check returns the number of failing rows; anything other than `0` fails the Job.
+
+| Check | Rule |
+|---|---|
+| Silver uniqueness | no duplicate `order_id` in `silver_table` |
+| Fact uniqueness | no duplicate `order_id` in `fact_sales` |
+| Fact keys | no `NULL` in `customer_sk`, `product_sk`, `payment_sk`, `region_sk`, `date_key` |
+| Completeness | row count Silver = row count Fact |
+| Dimension uniqueness | no duplicate `customer_id` in `dimcustomers` |
+| Measure consistency | `sales_amount = quantity * unit_price` |
+
+Results are appended to `gold.dq_results` (`check_name`, `failed_rows`, `status`, `run_ts`), giving a history of every run.
 
 ## 🧠 Key Design Decisions
 
-- **Incremental everywhere it earns its place** — Bronze, Silver, and the fact table are all watermark-driven; small reference dimensions (`DimPayments`, `DimRegion`) are kept simple via plain `DISTINCT` + `MERGE` rather than over-engineering incremental logic where the data volume doesn't justify it.
-- **Delta identity columns for surrogate keys** — decouples source-system IDs (`customer_id`, `product_id`) from warehouse keys, keeping fact-table foreign keys stable even if source identifiers change.
-- **SCD Type 1 for dimensions** — attributes are overwritten on update; historical versions aren't preserved, a deliberate simplification for this dataset (see Future Improvements for SCD2).
-
-<details>
-<summary><b>⚠️ Known limitation (click to expand)</b></summary>
-
-The watermark column (`last_updated`) is `DATE`, not `TIMESTAMP`. Because the incremental filter is a strict `>`, a record updated on the *same day* as the last successful load could be missed on the next run. Fine for daily-batch demo data; a production version should use a `TIMESTAMP` watermark (or `>=` with a de-dup-safe re-read window).
-
-</details>
+- **`TIMESTAMP` watermarks** — a strict `>` filter on a `DATE` column would skip records updated later on the same day as the last load; the change simulation tests this case explicitly.
+- **Deterministic deduplication** — `ROW_NUMBER()` has a tie-breaker (`ingestion_ts` / `process_ts`), so the same input always produces the same output.
+- **Unknown members (`-1`)** — a missing or unmatched dimension value maps to `-1` instead of a `NULL` key, so inner joins in BI tools don't silently drop fact rows.
+- **Incremental where it earns its place** — Bronze, Silver, the main dimensions and the fact are watermark-driven; small reference dimensions use plain `DISTINCT` + `MERGE`.
+- **Idempotent writes** — every layer writes through `MERGE` (or a watermark-filtered append), so re-running a step converges to the same result.
+- **SCD Type 1** — attributes are overwritten on update; history isn't kept (a deliberate simplification, see Future Improvements).
+- **Job as code** — the orchestration lives in the repo as an Asset Bundle, not only in the workspace UI.
 
 <details>
 <summary><b>🔄 Production backfill strategy (click to expand)</b></summary>
 
-This project's watermark is recomputed dynamically (`MAX(last_updated)` from the target table) rather than stored as a separate checkpoint, so a watermark-based batch pipeline like this one has no built-in way to reprocess a specific historical date range, and no protection against late-arriving source updates — a record that commits to the source *after* the pipeline has already advanced past its timestamp would simply be missed on every future run.
+The watermark is recomputed dynamically (`MAX(last_updated)` from the target table) rather than stored as a separate checkpoint. A pipeline like this has no built-in way to reprocess a specific historical date range, and no protection against late-arriving source updates — a record that commits to the source *after* the pipeline has moved past its timestamp would be missed on every future run.
 
-There are two production-grade ways to cover this. The first is a **parameterized date-range backfill**: the notebooks accept an optional start/end date, and when those parameters are set, the pipeline reprocesses that explicit window instead of relying on the dynamic watermark. This is reactive — someone (or a data-quality alert) has to notice that a gap exists and manually trigger a backfill run with the right dates — but it's cheap to add, and it's safe here specifically because every layer already writes through an idempotent `MERGE`, so reprocessing the same window any number of times just converges to the same result rather than creating duplicates.
+There are two production-grade ways to cover this. The first is a **parameterized date-range backfill**: the notebooks accept an optional start/end date, and when set, the pipeline reprocesses that window instead of relying on the dynamic watermark. It's reactive (someone or a DQ alert has to notice the gap), but it's cheap to add and safe here because every layer writes through an idempotent `MERGE`.
 
-The second is **CDC / Delta Lake Change Data Feed**: instead of filtering on a mutable timestamp column, each layer reads changes by table version or commit log, so a late-arriving write is picked up automatically no matter when it actually lands — nothing is ever silently missed. This is the structurally correct fix, but it's a bigger change: every layer needs to switch from a date-based filter to a version-based checkpoint, and it only works if applied consistently at *every* hop in the pipeline (Source → Bronze → Silver → Gold) — skip one layer and the exact same ordering problem just reappears one step down.
+The second is **Delta Lake Change Data Feed**: each layer reads changes by table version instead of filtering on a mutable timestamp, so late writes are picked up automatically. It's the structurally correct fix, but every hop (Source → Bronze → Silver → Gold) must switch to version-based checkpoints — skip one and the same problem reappears one step down. CDF is already enabled on the source table as a first step.
 
-**For this project, the parameterized backfill is the better fit.** The data volume and update frequency here don't justify the extra complexity of version-based checkpoints across every layer — an occasional late correction is easy to catch and reprocess manually, and the cost of building and maintaining CDC/CDF end to end would outweigh the benefit at this scale. CDC/CDF would earn its place in a higher-volume, business-critical pipeline where an undetected gap in fact data isn't an acceptable risk.
+**For this project, the parameterized backfill is the better fit** — the volume and update frequency don't justify version checkpoints across every layer. CDF would earn its place in a higher-volume, business-critical pipeline.
 
 </details>
 
@@ -111,33 +147,37 @@ The second is **CDC / Delta Lake Change Data Feed**: instead of filtering on a m
 
 | Technology | Purpose |
 |---|---|
-| Databricks | Notebook environment, compute |
-| Delta Lake | ACID tables, `MERGE`, identity columns |
-| Spark SQL | All transformation and modeling logic |
-| Databricks Jobs | Orchestration — conditional branching (If/else), watermark-driven Bronze → Silver → Gold |
+| Databricks (serverless) | Notebooks, compute |
+| Delta Lake / Unity Catalog | ACID tables, `MERGE`, identity columns, Change Data Feed |
+| Spark SQL / PySpark | Transformations, modeling, DQ checks |
+| Databricks Jobs | Orchestration with If/else branching |
+| Databricks Asset Bundles | Job definition and deployment as code |
 
 **Repository structure**
 ```
 databricks-medallion-warehouse/
-├── Source (intial load).ipynb   # creates + seeds the source table
-├── Batch load.ipynb             # simulates an insert + an update
+├── databricks.yml                 # bundle config (dev / prod targets)
+├── resources/
+│   └── full_pipeline_data_modeling_project.job.yml   # Job definition
+├── Check_Source_Exists.ipynb      # first run vs. incremental run
+├── Source_initial_load.ipynb      # creates + seeds the source table
+├── Batch_load.ipynb               # simulates inserts + an update
 ├── Bronze.ipynb
 ├── Silver.ipynb
 ├── Gold.ipynb
-└── Drop tables.ipynb            # teardown for a clean re-run
+├── Data_Quality_Checks.ipynb      # 6 checks, results → gold.dq_results
+└── Drop_tables.ipynb              # teardown for a clean re-run
 ```
 
 **Future Improvements**
-- Handle late-arriving records; move the watermark to `TIMESTAMP` granularity
-- Parameterized backfill mode (see above)
-- Data quality checks
+- Parameterized backfill mode (see above) or end-to-end Change Data Feed
 - SCD Type 2 for selected dimensions
-- Pipeline monitoring/logging, parameterized notebooks per environment
-- Automated testing
+- Larger, more realistic dataset
+- Alerts on `dq_results` failures
 - Connect the Gold layer to a BI tool (Power BI)
 
 </details>
 
 ---
 
-*Demonstrates Medallion architecture, Delta Lake `MERGE` patterns, watermark-based incremental loading, and dimensional modeling on Databricks.*
+*Demonstrates Medallion architecture, Delta Lake `MERGE` patterns, watermark-based incremental loading, dimensional modeling with Unknown members, data quality testing and Jobs-as-code on Databricks.*
