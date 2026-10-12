@@ -18,7 +18,7 @@ resources:
           condition_task:
             left: '{{tasks.Check_Source_Exists.values.source_exists}}'
             op: EQUAL_TO
-            right: True
+            right: '"true"'
           disabled: false
           email_notifications: {}
           run_if: ALL_SUCCESS
